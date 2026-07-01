@@ -23,11 +23,13 @@ led = LED(19)
 sensor_n = DistanceSensor(echo=17, trigger=4, max_distance=2.0)  
 sensor_e = DistanceSensor(echo=23, trigger=24, max_distance=2.0) 
 sensor_s = DistanceSensor(echo=21, trigger=20, max_distance=2.0) 
-sensor_w = DistanceSensor(echo=27, trigger=22, max_distance=2.0) 
+
+# FIX: Moved from pins 27 and 22 to pins 9 and 10
+sensor_w = DistanceSensor(echo=9, trigger=10, max_distance=2.0) 
 
 motor_fl = Motor(forward=5, backward=6, enable=13)   
-motor_fr = Motor(forward=22, backward=27, enable=12) 
-motor_rl = Motor(forward=16, backward=18, enable=25) 
+motor_fr = Motor(forward=22, backward=27, enable=12) # Now uniquely owns 22 and 27
+motor_rl = Motor(forward=16, backward=18, enable=25)  
 motor_rr = Motor(forward=8, backward=7, enable=11)   
 
 # --- STATE & COST MATRIX ---
