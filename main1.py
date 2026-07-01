@@ -1,94 +1,99 @@
 from gpiozero import DistanceSensor, Motor, Buzzer, LED
-from collections import deque
 import time
 import os
+import heapq  # Used for fast Dijkstra priority queue
 
-# --- MAZE DIMENSIONS & DESTINATIONS ---
+# --- MAZE DIMENSIONS & TARGETS ---
 MAP_WIDTH = 8   
 MAP_HEIGHT = 6  
 START_X = 4     
 START_Y = 0     
-
-# Define your target goal coordinates (e.g., top-right corner of the 8x6 grid)
 GOAL_X = 7
 GOAL_Y = 5
 
+# --- HIGH-SPEED CALIBRATION ---
 WALL_THRESHOLD_CM = 14.0
-CELL_TIME_S = 0.90      
-DRIVE_SPEED = 0.6       
+CELL_TIME_S = 0.55      # Dropped from 0.90 (Faster physical tile clearing)
+DRIVE_SPEED = 0.85      # Bumped from 0.60 for maximum momentum
 
 # --- HARDWARE SETUP ---
 buzzer = Buzzer(26)  
 led = LED(19)       
 
-# Ultrasonic Sensors
 sensor_n = DistanceSensor(echo=17, trigger=4, max_distance=2.0)  
 sensor_e = DistanceSensor(echo=23, trigger=24, max_distance=2.0) 
 sensor_s = DistanceSensor(echo=21, trigger=20, max_distance=2.0) 
 sensor_w = DistanceSensor(echo=27, trigger=22, max_distance=2.0) 
 
-# Omni Motors
 motor_fl = Motor(forward=5, backward=6, enable=13)   
 motor_fr = Motor(forward=22, backward=27, enable=12) 
 motor_rl = Motor(forward=16, backward=18, enable=25) 
 motor_rr = Motor(forward=8, backward=7, enable=11)   
 
-# --- STATE & MEMORY ---
+# --- STATE & COST MATRIX ---
 robot = {'x': START_X, 'y': START_Y}
-# 0 = Unvisited, 99 = Wall, 88 = Silver, 77 = Blue
 maze = [[0 for _ in range(MAP_HEIGHT)] for _ in range(MAP_WIDTH)]
 maze[robot['x']][robot['y']] = 1 
 
+# Time cost weights for pathfinding calculation
+# Normal step = 1 second | Blue step = 6 seconds (1s drive + 5s delay)
+cell_costs = [[1 for _ in range(MAP_HEIGHT)] for _ in range(MAP_WIDTH)]
+
 last_silver_checkpoint = (START_X, START_Y)
-
-# SYSTEM STATE: "EXPLORING", "RETURNING", or "FINISHED"
 robot_state = "EXPLORING" 
+last_move = None
 
-# --- RGB COLOR SENSOR INTERFACE ---
 def get_tile_color(direction):
-    """ Reads the RGB sensor via I2C Multiplexer (Placeholder logic) """
+    """ Reads RGB sensor via I2C Multiplexer (Placeholder) """
     return "NORMAL" 
 
-# --- PATHFINDING ENGINE (Breadth-First Search) ---
-def get_shortest_path_move(target_x, target_y):
+# --- OPTIMIZED PATHFINDER (DIJKSTRA'S ALGORITHM) ---
+def get_fastest_path_move(target_x, target_y):
     """
-    Analyzes the known memory matrix and calculates the immediate 
-    next directional slide needed to reach the target coordinates.
+    Calculates the fastest route to target coordinates based on actual
+    time penalties (weights) rather than just the number of tiles.
     """
     start = (robot['x'], robot['y'])
     if start == (target_x, target_y):
         return None
-        
-    queue = deque([start])
+
+    # Priority queue stores: (cumulative_time_cost, x, y)
+    pq = [(0, start[0], start[1])]
+    lowest_cost = {start: 0}
     parent = {start: None}
-    visited = {start}
-    
-    while queue:
-        curr = queue.popleft()
-        if curr == (target_x, target_y):
+
+    while pq:
+        curr_cost, cx, cy = heapq.heappop(pq)
+
+        if (cx, cy) == (target_x, target_y):
             break
-            
-        cx, cy = curr
-        # Maps 4 directions of movement
+
+        if curr_cost > lowest_cost.get((cx, cy), float('inf')):
+            continue
+
         neighbors = [
             ((cx, cy + 1), "NORTH"),
             ((cx + 1, cy), "EAST"),
             ((cx, cy - 1), "SOUTH"),
             ((cx - 1, cy), "WEST")
         ]
-        
+
         for (nx, ny), direction in neighbors:
             if 0 <= nx < MAP_WIDTH and 0 <= ny < MAP_HEIGHT:
-                # The pathfinder treats anything that isn't a confirmed wall (99) as open space
-                if maze[nx][ny] != 99 and (nx, ny) not in visited:
-                    visited.add((nx, ny))
-                    parent[(nx, ny)] = (curr, direction)
-                    queue.append((nx, ny))
-                    
-    # Reconstruct the path backwards to find the very next step
+                if maze[nx][ny] != 99:  # Avoid confirmed walls/black tiles
+                    # Calculate weight based on tile profile
+                    step_cost = cell_costs[nx][ny]
+                    total_cost = curr_cost + step_cost
+
+                    if total_cost < lowest_cost.get((nx, ny), float('inf')):
+                        lowest_cost[(nx, ny)] = total_cost
+                        parent[(nx, ny)] = ((cx, cy), direction)
+                        heapq.heappush(pq, (total_cost, nx, ny))
+
+    # Trace backwards to find immediate next action step
     curr = (target_x, target_y)
     if curr not in parent:
-        return None  # No available path found
+        return None  # No safe path available
         
     while parent[curr] is not None:
         prev, direction = parent[curr]
@@ -97,13 +102,34 @@ def get_shortest_path_move(target_x, target_y):
         curr = prev
     return None
 
-# --- MOVEMENT ACTIONS ---
-def stop_motors():
-    motor_fl.stop()
-    motor_fr.stop()
-    motor_rl.stop()
-    motor_rr.stop()
-    time.sleep(0.2)
+def find_nearest_unvisited():
+    """ Finds the closest coordinate with a visit value of 0 using Dijkstra """
+    start = (robot['x'], robot['y'])
+    pq = [(0, start[0], start[1])]
+    visited = {start}
+    
+    while pq:
+        cost, cx, cy = heapq.heappop(pq)
+        
+        if maze[cx][cy] == 0:
+            return cx, cy
+            
+        for nx, ny in [(cx, cy+1), (cx+1, cy), (cx, cy-1), (cx-1, cy)]:
+            if 0 <= nx < MAP_WIDTH and 0 <= ny < MAP_HEIGHT:
+                if maze[nx][ny] != 99 and (nx, ny) not in visited:
+                    visited.add((nx, ny))
+                    heapq.heappush(pq, (cost + cell_costs[nx][ny], nx, ny))
+    return None
+
+# --- MOVEMENT CONTROLS ---
+def stop_motors(force=False):
+    """ Smart stop: maintains rolling momentum unless forced to change direction """
+    if force:
+        motor_fl.stop()
+        motor_fr.stop()
+        motor_rl.stop()
+        motor_rr.stop()
+        time.sleep(0.1)
 
 def move_north():
     motor_fl.forward(speed=DRIVE_SPEED)
@@ -111,7 +137,6 @@ def move_north():
     motor_rl.forward(speed=DRIVE_SPEED)
     motor_rr.forward(speed=DRIVE_SPEED)
     time.sleep(CELL_TIME_S)
-    stop_motors()
     robot['y'] += 1
 
 def move_south():
@@ -120,7 +145,6 @@ def move_south():
     motor_rl.backward(speed=DRIVE_SPEED)
     motor_rr.backward(speed=DRIVE_SPEED)
     time.sleep(CELL_TIME_S)
-    stop_motors()
     robot['y'] -= 1
 
 def move_east():
@@ -129,7 +153,6 @@ def move_east():
     motor_rl.backward(speed=DRIVE_SPEED)
     motor_rr.forward(speed=DRIVE_SPEED)
     time.sleep(CELL_TIME_S)
-    stop_motors()
     robot['x'] += 1
 
 def move_west():
@@ -138,7 +161,6 @@ def move_west():
     motor_rl.backward(speed=DRIVE_SPEED)
     motor_rr.forward(speed=DRIVE_SPEED)
     time.sleep(CELL_TIME_S)
-    stop_motors()
     robot['x'] -= 1
 
 def is_valid_cell(x, y):
@@ -146,12 +168,12 @@ def is_valid_cell(x, y):
 
 def print_maze():
     os.system('clear' if os.name == 'posix' else 'cls')
-    print(f"=== OMNI-ROBOT MAP | STATE: {robot_state} ===")
+    print(f"=== OMNI-ROBOT FAST RUN | STATE: {robot_state} ===")
     for y in range(MAP_HEIGHT - 1, -1, -1):
         row_str = ""
         for x in range(MAP_WIDTH):
             if x == robot['x'] and y == robot['y']: row_str += " R "  
-            elif x == GOAL_X and y == GOAL_Y: row_str += " G " # Visual Goal Marker
+            elif x == GOAL_X and y == GOAL_Y: row_str += " G " 
             elif maze[x][y] == 99: row_str += " █ "  
             elif maze[x][y] == 88: row_str += " S "  
             elif maze[x][y] == 77: row_str += " B "  
@@ -160,30 +182,28 @@ def print_maze():
         print(row_str)
     print("==========================================")
 
-# --- MAIN CONTROLLER LOOP ---
+# --- MAIN EXECUTOR ---
 try:
-    print("Booting Navigation Core...")
+    print("Booting High-Speed Performance Profile...")
     time.sleep(2)
     
     while robot_state != "FINISHED":
-        # Check targets before scanning
+        # Check targets
         if robot_state == "EXPLORING" and robot['x'] == GOAL_X and robot['y'] == GOAL_Y:
             robot_state = "RETURNING"
-            buzzer.blink(on_time=0.3, off_time=0.2, n=3, background=False)
-            print_maze()
-            print("Goal Reached! Commencing Return Home via Shortest Path...")
-            time.sleep(2)
+            stop_motors(force=True)
+            buzzer.blink(on_time=0.1, off_time=0.1, n=5, background=False)
+            time.sleep(0.5)
 
         elif robot_state == "RETURNING" and robot['x'] == START_X and robot['y'] == START_Y:
             robot_state = "FINISHED"
-            print_maze()
-            print("Success! Back at starting position.")
+            stop_motors(force=True)
             buzzer.on()
-            time.sleep(1.5)
+            time.sleep(1.0)
             buzzer.off()
             break
 
-        # Read environment data
+        # Sensor sweeps
         dist_n = sensor_n.distance * 100
         dist_e = sensor_e.distance * 100
         dist_s = sensor_s.distance * 100
@@ -192,14 +212,12 @@ try:
         visits_n, visits_e, visits_s, visits_w = 999, 999, 999, 999
         color_n, color_e, color_s, color_w = "NORMAL", "NORMAL", "NORMAL", "NORMAL"
         
-        # --- PHASE 1: SENSOR ACQUISITION & MAP CONTEXT ---
+        # --- PHASE 1: HARDWARE READ & WALL MEMORY MAPPING ---
         # North
         tx, ty = robot['x'], robot['y'] + 1
         if is_valid_cell(tx, ty) and dist_n > WALL_THRESHOLD_CM and maze[tx][ty] != 99:
             color_n = get_tile_color("NORTH")
-            if color_n == "BLACK":
-                maze[tx][ty] = 99
-                buzzer.blink(on_time=0.1, off_time=0.1, n=1, background=True)
+            if color_n == "BLACK": maze[tx][ty] = 99
             else: visits_n = maze[tx][ty]
         elif is_valid_cell(tx, ty) and dist_n <= WALL_THRESHOLD_CM: maze[tx][ty] = 99
 
@@ -207,9 +225,7 @@ try:
         tx, ty = robot['x'] + 1, robot['y']
         if is_valid_cell(tx, ty) and dist_e > WALL_THRESHOLD_CM and maze[tx][ty] != 99:
             color_e = get_tile_color("EAST")
-            if color_e == "BLACK":
-                maze[tx][ty] = 99
-                buzzer.blink(on_time=0.1, off_time=0.1, n=1, background=True)
+            if color_e == "BLACK": maze[tx][ty] = 99
             else: visits_e = maze[tx][ty]
         elif is_valid_cell(tx, ty) and dist_e <= WALL_THRESHOLD_CM: maze[tx][ty] = 99
 
@@ -217,9 +233,7 @@ try:
         tx, ty = robot['x'], robot['y'] - 1
         if is_valid_cell(tx, ty) and dist_s > WALL_THRESHOLD_CM and maze[tx][ty] != 99:
             color_s = get_tile_color("SOUTH")
-            if color_s == "BLACK":
-                maze[tx][ty] = 99
-                buzzer.blink(on_time=0.1, off_time=0.1, n=1, background=True)
+            if color_s == "BLACK": maze[tx][ty] = 99
             else: visits_s = maze[tx][ty]
         elif is_valid_cell(tx, ty) and dist_s <= WALL_THRESHOLD_CM: maze[tx][ty] = 99
 
@@ -227,51 +241,63 @@ try:
         tx, ty = robot['x'] - 1, robot['y']
         if is_valid_cell(tx, ty) and dist_w > WALL_THRESHOLD_CM and maze[tx][ty] != 99:
             color_w = get_tile_color("WEST")
-            if color_w == "BLACK":
-                maze[tx][ty] = 99
-                buzzer.blink(on_time=0.1, off_time=0.1, n=1, background=True)
+            if color_w == "BLACK": maze[tx][ty] = 99
             else: visits_w = maze[tx][ty]
         elif is_valid_cell(tx, ty) and dist_w <= WALL_THRESHOLD_CM: maze[tx][ty] = 99
 
-        # --- PHASE 2: ALGORITHMIC DECISION MAKING ---
+        # --- PHASE 2: EXTREME TIME OPTIMIZED SEARCH ---
         move_decision = None
         target_color = "NORMAL"
 
         if robot_state == "EXPLORING":
-            # Traditional Explore Heuristic: Target the least-visited open track
             options = [visits_n, visits_e, visits_s, visits_w]
             min_visits = min(options)
 
             if min_visits == 999:
-                print("Trapped! Triggering Checkpoint Safe Rollback...")
-                robot['x'], robot['y'] = last_silver_checkpoint
-                continue
+                # If local cells are dead ends, pathfind to the nearest unvisited tile instantly
+                next_target = find_nearest_unvisited()
+                if next_target:
+                    move_decision = get_fastest_path_move(next_target[0], next_target[1])
+                else:
+                    # If whole maze is explored, go to goal directly
+                    move_decision = get_fastest_path_move(GOAL_X, GOAL_Y)
             else:
-                if visits_n == min_visits: move_decision, target_color = "NORTH", color_n
-                elif visits_e == min_visits: move_decision, target_color = "EAST", color_e
-                elif visits_s == min_visits: move_decision, target_color = "SOUTH", color_s
-                elif visits_w == min_visits: move_decision, target_color = "WEST", color_w
-
-        elif robot_state == "RETURNING":
-            # Shortest Path Heuristic: Compute instantaneous path vector back to Start (START_X, START_Y)
-            move_decision = get_shortest_path_move(START_X, START_Y)
+                if visits_n == min_visits: move_decision = "NORTH"
+                elif visits_e == min_visits: move_decision = "EAST"
+                elif visits_s == min_visits: move_decision = "SOUTH"
+                elif visits_w == min_visits: move_decision = "WEST"
             
-            # Map tracking colors dynamically during flight
+            # Extract target color attribute based on choice
             if move_decision == "NORTH": target_color = color_n
             elif move_decision == "EAST": target_color = color_e
             elif move_decision == "SOUTH": target_color = color_s
             elif move_decision == "WEST": target_color = color_w
 
-        # --- PHASE 3: EXECUTE FLIGHT PATTERN ---
+        elif robot_state == "RETURNING":
+            # Dijkstra Time-Optimized Calculation back to start
+            move_decision = get_fastest_path_move(START_X, START_Y)
+            if move_decision == "NORTH": target_color = color_n
+            elif move_decision == "EAST": target_color = color_e
+            elif move_decision == "SOUTH": target_color = color_s
+            elif move_decision == "WEST": target_color = color_w
+
+        # --- PHASE 3: MOMENTUM CONSERVATION MOVEMENT ---
+        if move_decision != last_move:
+            stop_motors(force=True)  # Only kill power if changing vectors
+
         if move_decision == "NORTH": move_north()
         elif move_decision == "EAST": move_east()
         elif move_decision == "SOUTH": move_south()
         elif move_decision == "WEST": move_west()
         else:
-            print("Error: No viable pathway found!")
-            break
+            # Trapped fallback
+            robot['x'], robot['y'] = last_silver_checkpoint
+            last_move = None
+            continue
 
-        # --- PHASE 4: UPDATE MEMORY LOGS & STEP DATA ---
+        last_move = move_decision
+
+        # --- PHASE 4: UPDATE MEMORY LOGS & PENALTIES ---
         if maze[robot['x']][robot['y']] not in [88, 77, 99]:
             maze[robot['x']][robot['y']] += 1
 
@@ -281,16 +307,21 @@ try:
 
         elif target_color == "BLUE":
             maze[robot['x']][robot['y']] = 77 
+            cell_costs[robot['x']][robot['y']] = 6  # Log high cost weight to avoid this tile later
+            stop_motors(force=True)
             print_maze()
             for _ in range(5):
                 led.on()
                 time.sleep(0.5)
                 led.off()
                 time.sleep(0.5)
+            last_move = None # Reset momentum after stalling
 
         print_maze()
-        time.sleep(0.1)
 
 except KeyboardInterrupt:
-    print("\nMission Aborted Manually.")
-    stop_motors()
+    print("\nRun Terminated Early.")
+    motor_fl.stop()
+    motor_fr.stop()
+    motor_rl.stop()
+    motor_rr.stop()
